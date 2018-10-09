@@ -296,6 +296,10 @@ bool WriteBatch::HasRollback() const {
   return (ComputeContentFlags() & ContentFlags::HAS_ROLLBACK) != 0;
 }
 
+// 从WriteBatch的rep_中解析出一条记录, 首先将*column_family设置成0，
+// 表示default column_family, 然后再从rep_中进行解析，如果发现不是
+// default colum_family, 再将其赋值成当前记录对应的column_family的
+// Id
 Status ReadRecordFromWriteBatch(Slice* input, char* tag,
                                 uint32_t* column_family, Slice* key,
                                 Slice* value, Slice* blob, Slice* xid) {
@@ -421,6 +425,8 @@ Status WriteBatch::Iterate(Handler* handler) const {
       tag = 0;
       column_family = 0;  // default
 
+      // 从当前的WriteBatch中解析出一条记录, 通过tag来判断执行什么操作, 然后
+      // 执行对应的操作
       s = ReadRecordFromWriteBatch(&input, &tag, &column_family, &key, &value,
                                    &blob, &xid);
       if (!s.ok()) {
@@ -620,6 +626,7 @@ size_t WriteBatchInternal::GetFirstOffset(WriteBatch* /*b*/) {
 
 Status WriteBatchInternal::Put(WriteBatch* b, uint32_t column_family_id,
                                const Slice& key, const Slice& value) {
+  // key和value的长度不能超过uint_32的最大值
   if (key.size() > size_t{port::kMaxUint32}) {
     return Status::InvalidArgument("key is too large");
   }
@@ -627,14 +634,27 @@ Status WriteBatchInternal::Put(WriteBatch* b, uint32_t column_family_id,
     return Status::InvalidArgument("value is too large");
   }
 
+  // 因为我们可以为一个WriteBatch设置max_bytes, 用于限制
+  // 一个WriteBatch写入数据的大小, 所以我们在将一个新的kv
+  // 添加到WriteBatch之前，首先记录一下当前WriteBatch的状态
+  // 再进行添加kv的操作, 最后执行save.commit()的时候会判断
+  // 添加了新的kv之后WriteBatch是否超出了max_bytes的限制，
+  // 如果超出了，则回退至上一个状态
   LocalSavePoint save(b);
+  // | <Sequence Number> | <Count> | <data> |
+  //       8 Bytes         4 Bytes
+  // 将Count取出，然后加1, 再设置回去
   WriteBatchInternal::SetCount(b, WriteBatchInternal::Count(b) + 1);
   if (column_family_id == 0) {
+    // 如果是默认的ColumnFamily，则直接追加0x1, 表示插入一条kv
     b->rep_.push_back(static_cast<char>(kTypeValue));
   } else {
+    // 如果不是默认的ColumnFamily, 则先追加0x5, 然后追加上当前ColumFaily
+    // 对应的Id作为标识，标识在对应的ColumFamily里面插入一条kv
     b->rep_.push_back(static_cast<char>(kTypeColumnFamilyValue));
     PutVarint32(&b->rep_, column_family_id);
   }
+  // 最后Append上key和value
   PutLengthPrefixedSlice(&b->rep_, key);
   PutLengthPrefixedSlice(&b->rep_, value);
   b->content_flags_.store(
@@ -645,6 +665,7 @@ Status WriteBatchInternal::Put(WriteBatch* b, uint32_t column_family_id,
 
 Status WriteBatch::Put(ColumnFamilyHandle* column_family, const Slice& key,
                        const Slice& value) {
+  // 根据传入的Column_family拿到其对应的Id
   return WriteBatchInternal::Put(this, GetColumnFamilyID(column_family), key,
                                  value);
 }
@@ -753,6 +774,11 @@ Status WriteBatchInternal::MarkRollback(WriteBatch* b, const Slice& xid) {
   return Status::OK();
 }
 
+// 看了WriteBatchInternal::Put()之后，这个Delete就很好理解了，同样的是先记录当前
+// WriteBatch的状态，然后判断是否是写入默认的ColumnFamily做对应的TypeDeletion标记
+// 再追加要删除的key，最后再在content_flags_里面标记当前WriteBatch里面有删除操作
+// 在save.commit()里面判断WriteBatch加入了当前的Delete操作之后是否超出了限制,
+// 如果超出了, 则执行回退操作
 Status WriteBatchInternal::Delete(WriteBatch* b, uint32_t column_family_id,
                                   const Slice& key) {
   LocalSavePoint save(b);
@@ -1225,6 +1251,7 @@ class MemTableInserter : public WriteBatch::Handler {
     }
 
     Status seek_status;
+    // 首先在cf_mems_内部将current_指向与column_family_id对应在ColumnFamilyData
     if (UNLIKELY(!SeekToColumnFamily(column_family_id, &seek_status))) {
       bool batch_boundry = false;
       if (rebuilding_trx_ != nullptr) {
@@ -1239,6 +1266,10 @@ class MemTableInserter : public WriteBatch::Handler {
     }
     Status ret_status;
 
+    // 获取当前cf_mems_指向的Column_family对应的MemTable
+    // 所以如果在同一个WriteBatch中对不同的Column_family
+    // 有写入操作, 那么会一条一条解析记录, 然后先拿到当前
+    // 记录的对应的Column_family进行操作
     MemTable* mem = cf_mems_->GetMemTable();
     auto* moptions = mem->GetImmutableMemTableOptions();
     // inplace_update_support is inconsistent with snapshots, and therefore with
